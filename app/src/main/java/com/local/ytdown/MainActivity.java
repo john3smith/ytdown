@@ -55,6 +55,7 @@ import com.yausername.youtubedl_android.mapper.VideoInfo;
 
 import java.io.File;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
 import java.util.Locale;
@@ -100,7 +101,7 @@ public final class MainActivity extends Activity {
     private TextView statusText;
     private TextView queueStatusText;
     private Button queueListButton;
-    private AlertDialog queueDialog;
+    private DownloadQueueDialog queueDialog;
     private IncompleteFilesDialog incompleteFilesDialog;
     private DownloadLogsDialog downloadLogsDialog;
     private final ThreadLocal<String> workerLogUrl = new ThreadLocal<>();
@@ -131,7 +132,10 @@ public final class MainActivity extends Activity {
     private int bulkAttempted;
     private int bulkSucceeded;
     private int bulkFailed;
+    private int bulkSkipped;
     private String bulkUsername;
+    /** Task owning the current download generation; read only on the UI thread. */
+    private DownloadQueue.Task activeTask;
     private String lastAutoStartedUrl;
     private String pendingSharedUrl;
     private boolean sharedIntentActive;
@@ -933,6 +937,7 @@ public final class MainActivity extends Activity {
         bulkAttempted = 0;
         bulkSucceeded = 0;
         bulkFailed = 0;
+        bulkSkipped = 0;
         bulkUsername = null;
         bulkMediaUrls.clear();
         String scanningStatus = getString(R.string.status_scanning_account, platformName);
@@ -1021,8 +1026,15 @@ public final class MainActivity extends Activity {
                     getString(R.string.no_account_media, platformName));
             return;
         }
-        bulkMediaUrls.addAll(urls);
-        bulkTotal = urls.size();
+        // Discovery can report one post through several links; keep the first, newest-first order.
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        for (String mediaUrl : urls) {
+            if (seen.add(DownloadedMediaHistory.normalizeUrl(mediaUrl))) bulkMediaUrls.add(mediaUrl);
+        }
+        if (bulkMediaUrls.size() < urls.size()) {
+            logDownload("중복 미디어 링크 제외: " + (urls.size() - bulkMediaUrls.size()) + "개");
+        }
+        bulkTotal = bulkMediaUrls.size();
         videoTitleText.setText(getString(
                 R.string.bulk_account_title, platformName, bulkUsername));
         updateQueueUi();
@@ -1075,16 +1087,30 @@ public final class MainActivity extends Activity {
             getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
             return;
         }
-        String url = bulkMediaUrls.pollFirst();
+        boolean audioOnly = accountTask != null && accountTask.audioOnly;
+        String url;
+        int skippedBefore = bulkSkipped;
+        // Only links that never finished successfully in this mode are downloaded again.
+        while ((url = bulkMediaUrls.pollFirst()) != null
+                && DownloadedMediaHistory.contains(this, url, format, audioOnly)) {
+            bulkSkipped++;
+        }
+        if (bulkSkipped > skippedBefore) {
+            logDownload("이미 받은 미디어 건너뜀: " + (bulkSkipped - skippedBefore) + "개");
+            updateQueueUi();
+        }
         if (url == null) {
             finishBulkDiscovery(true, null);
             return;
         }
         statusText.setText(getString(R.string.bulk_attempting,
-                bulkAttempted + 1, bulkTotal));
-        startDownload(new DownloadQueue.Task(url, format, false,
-                accountTask != null && accountTask.audioOnly,
+                bulkProcessed() + 1, bulkTotal));
+        startDownload(new DownloadQueue.Task(url, format, false, audioOnly,
                 accountTask != null && accountTask.httpsAssist));
+    }
+
+    private int bulkProcessed() {
+        return bulkAttempted + bulkSkipped;
     }
 
     private void finishBulkDiscovery(boolean success, String detail) {
@@ -1107,9 +1133,14 @@ public final class MainActivity extends Activity {
         if (success) {
             progressBar.setProgress(100);
             percentText.setText(getString(R.string.percent_format, 100));
-            String completionText = getString(
-                    R.string.bulk_complete, bulkUsername, bulkAttempted,
-                    bulkSucceeded, bulkFailed);
+            // A rescan with nothing new is a normal completion, not a failure.
+            String completionText = bulkAttempted == 0 && bulkSkipped > 0
+                    ? getString(R.string.bulk_all_skipped, bulkUsername, bulkSkipped)
+                    : getString(R.string.bulk_complete, bulkUsername, bulkAttempted,
+                            bulkSucceeded, bulkFailed);
+            if (bulkAttempted > 0 && bulkSkipped > 0) {
+                completionText += getString(R.string.bulk_skipped, bulkSkipped);
+            }
             if (bulkFailed > 0) {
                 completionText += getString(R.string.bulk_failures_hint);
             }
@@ -1136,8 +1167,18 @@ public final class MainActivity extends Activity {
         String url = task.url;
         if (bulkMode || downloading || downloadQueue.size() > 0
                 || (wifiOnlySwitch.isChecked() && !isWifiConnected())) {
-            if (url.equals(activeUrl) || (accountTask != null && url.equals(accountTask.url))
-                    || downloadQueue.contains(url)) {
+            // A running account scan only sees media found before it started, so one follow-up
+            // scan of the same account may wait in the queue; already saved media are skipped
+            // by the per-media download path. The pending check keeps it to a single rescan.
+            boolean accountRescan = task.account && accountTask != null
+                    && url.equals(accountTask.url);
+            if (downloadQueue.contains(url)) {
+                toast(task.account ? R.string.account_rescan_already_queued
+                        : R.string.already_downloading);
+                return;
+            }
+            if (url.equals(activeUrl) || (accountTask != null && url.equals(accountTask.url)
+                    && !accountRescan)) {
                 toast(R.string.already_downloading);
                 return;
             }
@@ -1147,7 +1188,8 @@ public final class MainActivity extends Activity {
             }
             downloadQueue.offer(task, activeUrl);
             updateQueueUi();
-            Toast.makeText(this, getString(R.string.queue_added, downloadQueue.size()),
+            Toast.makeText(this, getString(accountRescan ? R.string.account_rescan_queued
+                            : R.string.queue_added, downloadQueue.size()),
                     Toast.LENGTH_SHORT).show();
             if (downloading) {
                 showProgressNotification(currentProgress, false);
@@ -1192,6 +1234,7 @@ public final class MainActivity extends Activity {
         downloading = true;
         long generation = ++downloadGeneration;
         activeUrl = task.url;
+        activeTask = task;
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         setDownloadingUi(true);
         statusText.setText(R.string.status_starting);
@@ -1258,59 +1301,64 @@ public final class MainActivity extends Activity {
                     ? getString(R.string.wifi_waiting,
                             bulkMode ? bulkMediaUrls.size() : downloadQueue.size())
                     : bulkMode
-                    ? (bulkScanning ? "계정 미디어 검색 중" : getString(R.string.bulk_progress, bulkAttempted, bulkTotal))
+                    ? (bulkScanning ? "계정 미디어 검색 중" : getString(R.string.bulk_progress, bulkProcessed(), bulkTotal))
                             + " · 대기 " + downloadQueue.size() + "개"
                     : getString(R.string.queue_status, downloadQueue.size()));
         }
         if (queueListButton != null) {
             queueListButton.setEnabled(downloadQueue.size() > 0 || accountTask != null);
         }
-        if (queueDialog != null && queueDialog.isShowing()) {
-            queueDialog.dismiss();
-            queueDialog = null;
-            if (accountTask != null || downloadQueue.size() > 0) showQueueDialog();
-        }
+        if (queueDialog != null) queueDialog.refresh();
     }
 
     private void showQueueDialog() {
-        List<DownloadQueue.Task> tasks = downloadQueue.snapshot();
-        if (accountTask != null) tasks.add(0, accountTask);
-        if (tasks.isEmpty()) {
+        if (accountTask == null && downloadQueue.size() == 0) {
             toast(R.string.queue_empty);
             return;
         }
-        String[] labels = new String[tasks.size()];
-        for (int index = 0; index < tasks.size(); index++) {
-            DownloadQueue.Task task = tasks.get(index);
-            String state = task == accountTask
-                    ? (bulkScanning ? "미디어 검색 중" : "다운로드 " + bulkAttempted + "/" + bulkTotal)
-                    : "대기";
-            labels[index] = (index + 1) + ". [" + (task.account ? "계정 · " : "")
-                    + (task.audioOnly ? "음원 · " : "")
-                    + state + "] " + task.url;
+        if (queueDialog == null) {
+            queueDialog = new DownloadQueueDialog(this, new DownloadQueueDialog.Host() {
+                @Override
+                public List<DownloadQueueDialog.Item> items() {
+                    return queueDialogItems();
+                }
+
+                @Override
+                public int pendingCount() {
+                    return downloadQueue.size();
+                }
+
+                @Override
+                public void cancel(DownloadQueue.Task task) {
+                    if (task == accountTask) {
+                        cancelDownload(false);
+                        startNextQueuedDownload();
+                    } else if (downloadQueue.remove(task.url)) {
+                        updateQueueUi();
+                        toast(R.string.queue_item_cancelled);
+                    }
+                }
+            });
         }
-        queueDialog = new AlertDialog.Builder(this)
-                .setTitle(R.string.queue_list)
-                .setItems(labels, (dialog, selected) -> {
-                    DownloadQueue.Task task = tasks.get(selected);
-                    new AlertDialog.Builder(this)
-                            .setMessage(task.url)
-                            .setNegativeButton(R.string.close, null)
-                            .setPositiveButton(R.string.queue_cancel_item, (confirm, which) -> {
-                                if (task == accountTask) {
-                                    cancelDownload(false);
-                                    startNextQueuedDownload();
-                                } else if (downloadQueue.remove(task.url)) {
-                                    updateQueueUi();
-                                    toast(R.string.queue_item_cancelled);
-                                }
-                                if (downloadQueue.size() > 0) {
-                                    showQueueDialog();
-                                }
-                            }).show();
-                })
-                .setNegativeButton(R.string.close, null)
-                .show();
+        queueDialog.show();
+    }
+
+    private List<DownloadQueueDialog.Item> queueDialogItems() {
+        List<DownloadQueueDialog.Item> items = new ArrayList<>();
+        if (accountTask != null) {
+            items.add(new DownloadQueueDialog.Item(accountTask, true, false, bulkScanning
+                    ? getString(R.string.queue_state_scanning)
+                    : getString(R.string.queue_state_bulk, bulkProcessed(), bulkTotal)));
+        }
+        List<DownloadQueue.Task> pending = downloadQueue.snapshot();
+        for (int index = 0; index < pending.size(); index++) {
+            DownloadQueue.Task task = pending.get(index);
+            boolean rescan = task.account && accountTask != null
+                    && task.url.equals(accountTask.url);
+            items.add(new DownloadQueueDialog.Item(task, false, rescan,
+                    getString(R.string.queue_state_waiting, index + 1)));
+        }
+        return items;
     }
 
     private boolean isWifiConnected() {
@@ -1899,6 +1947,7 @@ public final class MainActivity extends Activity {
         }
         downloading = false;
         activeUrl = null;
+        activeTask = null;
         bulkMode = false;
         bulkMediaUrls.clear();
         if (clearPending) downloadQueue.clear();
@@ -1916,9 +1965,16 @@ public final class MainActivity extends Activity {
             return;
         }
         logDownload(success ? "작업 성공" : "작업 실패: " + detail);
+        DownloadQueue.Task finished = activeTask;
+        // Success here means the worker verified the saved output for the whole link; failed,
+        // partial and cancelled links (stale generation) are not recorded and stay retryable.
+        if (success && finished != null) {
+            DownloadedMediaHistory.record(this, finished.url, finished.format, finished.audioOnly);
+        }
         downloading = false;
         activeDownloadFuture = null;
         activeUrl = null;
+        activeTask = null;
         boolean sessionContinues = bulkMode || downloadQueue.size() > 0;
         if (!sessionContinues) {
             getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
@@ -1955,7 +2011,7 @@ public final class MainActivity extends Activity {
                 finishBulkDiscovery(true, null);
             } else {
                 statusText.setText(getString(R.string.bulk_waiting,
-                        bulkAttempted, bulkTotal));
+                        bulkProcessed(), bulkTotal));
                 setDownloadingUi(false);
                 cancelButton.setEnabled(true);
                 startNextBulkDownload();
@@ -2318,6 +2374,7 @@ public final class MainActivity extends Activity {
         activityDestroyed = true;
         if (incompleteFilesDialog != null) incompleteFilesDialog.dismiss();
         if (downloadLogsDialog != null) downloadLogsDialog.dismiss();
+        if (queueDialog != null) queueDialog.dismiss();
         if (serviceReceiverRegistered) {
             unregisterReceiver(downloadServiceReceiver);
             serviceReceiverRegistered = false;
