@@ -280,10 +280,49 @@ final class SocialImageDownloader {
         if (shortcode == null) {
             throw new IllegalArgumentException("Instagram 게시물 주소를 확인하지 못했습니다.");
         }
-        String html = readText("https://www.instagram.com/p/" + shortcode
-                        + "/embed/captioned/", NetscapeCookieJar.load(cookieFile),
-                INSTAGRAM_EMBED_USER_AGENT, cancelled);
-        return instagramUsernameFromEmbedHtml(html);
+        NetscapeCookieJar cookies = NetscapeCookieJar.load(cookieFile);
+        return resolveInstagramPostOwner(shortcode,
+                hasInstagramSession(cookies)
+                        ? () -> readInstagramPost(shortcode, cookies, cancelled) : null,
+                // The fallback is anonymous so a failed session request never leaks cookies elsewhere.
+                () -> readText("https://www.instagram.com/p/" + shortcode + "/embed/captioned/",
+                        null, INSTAGRAM_EMBED_USER_AGENT, cancelled),
+                cancelled);
+    }
+
+    interface InstagramSource<T> {
+        T read() throws Exception;
+    }
+
+    /** Prefer the authenticated media-info owner; login/security challenges and
+     * cancellation stop here, other failures use the anonymous embed. */
+    static String resolveInstagramPostOwner(String shortcode,
+                                            InstagramSource<JSONObject> authenticatedPost,
+                                            InstagramSource<String> anonymousEmbed,
+                                            BooleanSupplier cancelled) throws Exception {
+        if (cancelled.getAsBoolean()) throw new InterruptedException("다운로드가 취소되었습니다.");
+        if (authenticatedPost != null) {
+            try {
+                String owner = instagramOwnerFromPost(authenticatedPost.read(), shortcode);
+                if (owner != null) return owner;
+            } catch (LoginRequiredException | InterruptedException blocked) {
+                throw blocked;
+            } catch (Exception unavailable) {
+                // Fall back to the anonymous embed below.
+            }
+            if (cancelled.getAsBoolean() || Thread.currentThread().isInterrupted()) {
+                throw new InterruptedException("다운로드가 취소되었습니다.");
+            }
+        }
+        return instagramUsernameFromEmbedHtml(anonymousEmbed.read());
+    }
+
+    /** Only the post's direct {@code user.username}; nested users (tags, coauthors) are ignored. */
+    static String instagramOwnerFromPost(JSONObject post, String shortcode) throws IOException {
+        requireInstagramPostIdentity(post, shortcode);
+        JSONObject user = post.optJSONObject("user");
+        String username = user == null ? "" : user.optString("username").trim();
+        return username.matches("[A-Za-z0-9._]{1,30}") ? username : null;
     }
 
     static String xUsernameFromUrl(String sourceUrl) {
@@ -1362,8 +1401,7 @@ final class SocialImageDownloader {
             throws Exception {
         listener.onLog("Instagram 사진 검사 시작");
         NetscapeCookieJar cookies = NetscapeCookieJar.load(cookieFile);
-        String cookieHeader = cookieHeader(cookies, "https://www.instagram.com/");
-        if (cookieHeader != null && Pattern.compile("(?:^|;\\s*)sessionid=").matcher(cookieHeader).find()) {
+        if (hasInstagramSession(cookies)) {
             listener.onLog("Instagram 로그인 세션으로 게시물 전체 미디어 조회");
             try {
                 JSONObject post = readInstagramPost(shortcode, cookies, listener::isCancelled);
@@ -1495,16 +1533,26 @@ final class SocialImageDownloader {
         return result.toString();
     }
 
-    /** Read explicit media types so a video's preview is never saved as a photo. */
-    static XMedia parseInstagramPost(JSONObject post, String shortcode) throws Exception {
+    private static void requireInstagramPostIdentity(JSONObject post, String shortcode)
+            throws IOException {
         String expectedId = instagramMediaId(shortcode);
-        String code = post.optString("code");
-        String pk = post.optString("pk", post.optString("id")).split("_", 2)[0];
+        String code = post == null ? "" : post.optString("code");
+        String pk = post == null ? "" : post.optString("pk", post.optString("id")).split("_", 2)[0];
         if ((!code.isEmpty() && !code.equals(shortcode))
                 || (!pk.isEmpty() && !pk.equals(expectedId))
                 || (code.isEmpty() && pk.isEmpty())) {
             throw new IOException("요청한 Instagram 게시물과 미디어 응답이 일치하지 않습니다.");
         }
+    }
+
+    private static boolean hasInstagramSession(NetscapeCookieJar cookies) {
+        String header = cookieHeader(cookies, "https://www.instagram.com/");
+        return header != null && Pattern.compile("(?:^|;\\s*)sessionid=").matcher(header).find();
+    }
+
+    /** Read explicit media types so a video's preview is never saved as a photo. */
+    static XMedia parseInstagramPost(JSONObject post, String shortcode) throws Exception {
+        requireInstagramPostIdentity(post, shortcode);
         JSONArray items;
         if (post.optInt("media_type") == 8) {
             items = post.optJSONArray("carousel_media");

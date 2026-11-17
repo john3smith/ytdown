@@ -1284,3 +1284,10 @@ named OpenSSL/SQLite ABIs were inspected and retained to protect loading/TLS.
   APK/Release integrity and LAN delivery have separate local receipts.
 - No new external dependencies or assets. Existing FFmpeg/runtime licenses and
   corresponding-source links from v1.9.42 remain unchanged.
+
+## 2026-11-17 Instagram account owner resolution (1.9.45)
+- Baseline: feature/link-download-logs-20261112, local and fetched upstream 13467a5, clean and 0/0 before edits.
+- Root cause: account discovery resolved post author only from public embed HTML; authenticated single-post media-info already worked.
+- Change: reuse scoped authenticated media-info and validated post identity plus direct user.username, retain anonymous fallback and propagate security/cancellation errors.
+- Validation: 187 release JVM tests pass including seven new owner tests; release lint 0 errors, 25 warnings. Actual authenticated Instagram account scan/download remains unverified; emulator UI observations stalled. Build/sign/package and delivery receipts are retained locally.
+- Implementation: Claude CLI claude-opus-5-5 medium; review/build/verification: main Codex agent.
