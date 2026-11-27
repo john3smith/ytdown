@@ -135,12 +135,26 @@ final class SocialImageDownloader {
         final int videoCount;
         final boolean hasVideo;
         final boolean unresolvedVideo;
+        final int skippedImageCount;
+        final int skippedVideoCount;
 
         Result(int imageCount, int videoCount, boolean hasVideo, boolean unresolvedVideo) {
+            this(imageCount, videoCount, hasVideo, unresolvedVideo, 0, 0);
+        }
+
+        Result(int imageCount, int videoCount, boolean hasVideo, boolean unresolvedVideo,
+               int skippedImageCount, int skippedVideoCount) {
             this.imageCount = imageCount;
             this.videoCount = videoCount;
             this.hasVideo = hasVideo;
             this.unresolvedVideo = unresolvedVideo;
+            this.skippedImageCount = skippedImageCount;
+            this.skippedVideoCount = skippedVideoCount;
+        }
+
+        boolean allSkipped() {
+            int total = imageCount + videoCount;
+            return total > 0 && (skippedImageCount + skippedVideoCount) >= total;
         }
     }
 
@@ -1089,16 +1103,18 @@ final class SocialImageDownloader {
         String title = TextUtils.isEmpty(username)
                 ? "X " + statusId : "X @" + username + " " + statusId;
         listener.onTitle(title);
+        int skippedImages = 0;
+        int skippedVideos = 0;
         if (!images.isEmpty()) {
-            downloadImages(context, images, outputDirectory, title,
+            skippedImages = downloadImages(context, images, outputDirectory, title,
                     imagesFromHtmlFallback, listener);
         }
         if (downloadDirectVideos && !videos.isEmpty()) {
-            downloadVideos(context, videos, outputDirectory, title,
+            skippedVideos = downloadVideos(context, videos, outputDirectory, title,
                     NetscapeCookieJar.load(cookieFile), listener);
         }
         return new Result(images.size(), downloadDirectVideos ? videos.size() : 0,
-                hasVideo, unresolvedVideo);
+                hasVideo, unresolvedVideo, skippedImages, skippedVideos);
     }
 
     private static JSONObject readXTweet(String statusId) throws Exception {
@@ -1412,14 +1428,16 @@ final class SocialImageDownloader {
                 listener.onLog("Instagram 전체 미디어: 사진 " + media.imageUrls.size()
                         + "개, 영상 " + media.videoUrls.size() + "개, 미해결 영상=" + media.unresolvedVideo);
                 listener.onTitle(title);
+                int skippedImages = 0;
+                int skippedVideos = 0;
                 if (!media.imageUrls.isEmpty()) {
-                    downloadImages(context, media.imageUrls, outputDirectory, title, false, listener);
+                    skippedImages = downloadImages(context, media.imageUrls, outputDirectory, title, false, listener);
                 }
                 if (downloadDirectVideos && !media.videoUrls.isEmpty()) {
-                    downloadVideos(context, media.videoUrls, outputDirectory, title, cookies, listener);
+                    skippedVideos = downloadVideos(context, media.videoUrls, outputDirectory, title, cookies, listener);
                 }
                 return new Result(media.imageUrls.size(), downloadDirectVideos ? media.videoUrls.size() : 0,
-                        media.hasVideo, media.unresolvedVideo);
+                        media.hasVideo, media.unresolvedVideo, skippedImages, skippedVideos);
             } catch (LoginRequiredException | InterruptedException blocked) {
                 throw blocked;
             } catch (Exception unavailable) {
@@ -1459,19 +1477,21 @@ final class SocialImageDownloader {
         if (!images.isEmpty() || !videos.isEmpty()) {
             listener.onTitle(title);
         }
+        int skippedImages = 0;
+        int skippedVideos = 0;
         if (!images.isEmpty()) {
             boolean rejectThumbnailSizedFallback = !hasVideo
                     && (allowAmbiguousFallback || "GraphImage".equals(
                     firstGroup(MEDIA_TYPE, normalized)));
-            downloadImages(context, images, outputDirectory, title,
+            skippedImages = downloadImages(context, images, outputDirectory, title,
                     rejectThumbnailSizedFallback, listener);
         }
         if (downloadDirectVideos && !videos.isEmpty()) {
-            downloadVideos(context, videos, outputDirectory, title,
+            skippedVideos = downloadVideos(context, videos, outputDirectory, title,
                     NetscapeCookieJar.load(cookieFile), listener);
         }
         return new Result(images.size(), downloadDirectVideos ? videos.size() : 0,
-                hasVideo, media.unresolvedVideo);
+                hasVideo, media.unresolvedVideo, skippedImages, skippedVideos);
     }
 
     /** Instagram's normal authenticated media endpoint, also used by upstream yt-dlp.
@@ -1769,15 +1789,27 @@ final class SocialImageDownloader {
         return decodeHtml(bestUrl);
     }
 
-    private static void downloadImages(Context context, List<String> urls, File outputDirectory,
-                                       String title, boolean rejectThumbnailSizedFallback,
-                                       Listener listener) throws Exception {
+    private static int downloadImages(Context context, List<String> urls, File outputDirectory,
+                                      String title, boolean rejectThumbnailSizedFallback,
+                                      Listener listener) throws Exception {
         String baseName = sanitizeFileName(title);
+        int skipped = 0;
         for (int index = 0; index < urls.size(); index++) {
             if (listener.isCancelled()) {
                 throw new InterruptedException("다운로드가 취소되었습니다.");
             }
             String imageUrl = urls.get(index);
+            String suffix = urls.size() == 1 ? "" : String.format(Locale.US, "-%02d", index + 1);
+            String knownExtension = imageExtensionFromUrl(imageUrl);
+            if (knownExtension != null) {
+                String preCheckName = baseName + suffix + knownExtension;
+                if (ExistingDownloadLookup.fileExists(context, outputDirectory, preCheckName)) {
+                    skipped++;
+                    listener.onLog("이미 저장된 사진 파일 건너뜀: " + preCheckName);
+                    listener.onProgress((int) Math.round(((index + 1.0) / urls.size()) * 100.0));
+                    continue;
+                }
+            }
             HttpURLConnection connection = open(imageUrl, null);
             long length = connection.getContentLengthLong();
             String contentType = connection.getContentType();
@@ -1786,8 +1818,14 @@ final class SocialImageDownloader {
                 throw new IllegalStateException("이미지 대신 " + contentType + " 응답을 받았습니다.");
             }
             String extension = imageExtension(imageUrl, contentType);
-            String suffix = urls.size() == 1 ? "" : String.format(Locale.US, "-%02d", index + 1);
             String fileName = baseName + suffix + extension;
+            if (ExistingDownloadLookup.fileExists(context, outputDirectory, fileName)) {
+                connection.disconnect();
+                skipped++;
+                listener.onLog("이미 저장된 사진 파일 건너뜀: " + fileName);
+                listener.onProgress((int) Math.round(((index + 1.0) / urls.size()) * 100.0));
+                continue;
+            }
             listener.onLog("사진 저장 시작: " + fileName + " ("
                     + (length > 0 ? length + " bytes" : "크기 미상") + ")");
             File destination = null;
@@ -1814,7 +1852,7 @@ final class SocialImageDownloader {
                         throw new IllegalStateException("다운로드 파일을 열지 못했습니다.");
                     }
                 } else {
-                    destination = uniqueFile(outputDirectory, baseName + suffix, extension);
+                    destination = new File(outputDirectory, fileName);
                     destinationStream = new FileOutputStream(destination);
                 }
                 long received = 0;
@@ -1856,6 +1894,7 @@ final class SocialImageDownloader {
             listener.onLog("사진 저장 완료: " + fileName);
             listener.onProgress((int) Math.round(((index + 1.0) / urls.size()) * 100.0));
         }
+        return skipped;
     }
 
     private static int[] readImageBounds(Context context, Uri uri, File file)
@@ -1874,15 +1913,25 @@ final class SocialImageDownloader {
         return new int[]{options.outWidth, options.outHeight};
     }
 
-    private static void downloadVideos(Context context, List<String> urls, File outputDirectory,
-                                       String title, NetscapeCookieJar cookies, Listener listener)
+    private static int downloadVideos(Context context, List<String> urls, File outputDirectory,
+                                      String title, NetscapeCookieJar cookies, Listener listener)
             throws Exception {
         String baseName = sanitizeFileName(title);
+        int skipped = 0;
         for (int index = 0; index < urls.size(); index++) {
             if (listener.isCancelled()) {
                 throw new InterruptedException("다운로드가 취소되었습니다.");
             }
             String videoUrl = urls.get(index);
+            String suffix = urls.size() == 1 ? "-video"
+                    : String.format(Locale.US, "-video-%02d", index + 1);
+            String fileName = baseName + suffix + ".mp4";
+            if (ExistingDownloadLookup.fileExists(context, outputDirectory, fileName)) {
+                skipped++;
+                listener.onLog("이미 저장된 동영상 파일 건너뜀: " + fileName);
+                listener.onProgress((int) Math.round(((index + 1.0) / urls.size()) * 100.0));
+                continue;
+            }
             HttpURLConnection connection = open(videoUrl, cookies);
             long length = connection.getContentLengthLong();
             String contentType = connection.getContentType();
@@ -1890,9 +1939,6 @@ final class SocialImageDownloader {
                 connection.disconnect();
                 throw new IllegalStateException("동영상 대신 이미지 응답을 받았습니다.");
             }
-            String suffix = urls.size() == 1 ? "-video"
-                    : String.format(Locale.US, "-video-%02d", index + 1);
-            String fileName = baseName + suffix + ".mp4";
             listener.onLog("직접 동영상 저장 시작: " + fileName + " ("
                     + (length > 0 ? length + " bytes" : "크기 미상") + ")");
 
@@ -1920,7 +1966,7 @@ final class SocialImageDownloader {
                         throw new IllegalStateException("동영상 파일을 열지 못했습니다.");
                     }
                 } else {
-                    destination = uniqueFile(outputDirectory, baseName + suffix, ".mp4");
+                    destination = new File(outputDirectory, fileName);
                     destinationStream = new FileOutputStream(destination);
                 }
                 // Own the destination before opening the response, and do not publish
@@ -1954,6 +2000,7 @@ final class SocialImageDownloader {
             listener.onLog("직접 동영상 저장 완료: " + fileName + " (" + received + " bytes)");
             listener.onProgress((int) Math.round(((index + 1.0) / urls.size()) * 100.0));
         }
+        return skipped;
     }
 
     private static String readText(String url, NetscapeCookieJar cookies) throws Exception {
@@ -2132,18 +2179,41 @@ final class SocialImageDownloader {
         return url + (url.contains("?") ? "&" : "?") + "name=orig";
     }
 
-    private static String imageExtension(String url, String contentType) {
-        String path = URI.create(url).getPath().toLowerCase(Locale.US);
-        for (String extension : new String[]{".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"}) {
-            if (path.endsWith(extension)) {
-                return extension;
+    static String imageExtensionFromUrl(String url) {
+        try {
+            URI uri = URI.create(url);
+            String path = uri.getPath() == null ? "" : uri.getPath().toLowerCase(Locale.US);
+            for (String extension : new String[]{".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"}) {
+                if (path.endsWith(extension)) {
+                    return extension;
+                }
             }
+            String format = DownloadedMediaHistory.queryParam(uri.getRawQuery(), "format");
+            if (format != null) {
+                String lower = format.toLowerCase(Locale.US);
+                for (String known : new String[]{"jpg", "jpeg", "png", "webp", "gif", "avif"}) {
+                    if (known.equals(lower)) {
+                        return "." + known;
+                    }
+                }
+            }
+        } catch (IllegalArgumentException ignored) {
+            return null;
+        }
+        return null;
+    }
+
+    private static String imageExtension(String url, String contentType) {
+        String fromUrl = imageExtensionFromUrl(url);
+        if (fromUrl != null) {
+            return fromUrl;
         }
         if (contentType != null) {
-            if (contentType.contains("png")) return ".png";
-            if (contentType.contains("webp")) return ".webp";
-            if (contentType.contains("gif")) return ".gif";
-            if (contentType.contains("avif")) return ".avif";
+            String lower = contentType.toLowerCase(Locale.US);
+            if (lower.contains("png")) return ".png";
+            if (lower.contains("webp")) return ".webp";
+            if (lower.contains("gif")) return ".gif";
+            if (lower.contains("avif")) return ".avif";
         }
         return ".jpg";
     }
@@ -2151,14 +2221,5 @@ final class SocialImageDownloader {
     private static String sanitizeFileName(String value) {
         String clean = value.replaceAll("[\\\\/:*?\"<>|]", "_").trim();
         return clean.length() <= 160 ? clean : clean.substring(0, 160).trim();
-    }
-
-    private static File uniqueFile(File directory, String baseName, String extension) {
-        File candidate = new File(directory, baseName + extension);
-        int copy = 2;
-        while (candidate.exists()) {
-            candidate = new File(directory, baseName + " (" + copy++ + ")" + extension);
-        }
-        return candidate;
     }
 }

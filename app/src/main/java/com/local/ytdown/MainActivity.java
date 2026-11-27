@@ -1092,7 +1092,7 @@ public final class MainActivity extends Activity {
         int skippedBefore = bulkSkipped;
         // Only links that never finished successfully in this mode are downloaded again.
         while ((url = bulkMediaUrls.pollFirst()) != null
-                && DownloadedMediaHistory.contains(this, url, format, audioOnly)) {
+                && isBulkMediaAlreadyDownloaded(url, format, audioOnly)) {
             bulkSkipped++;
         }
         if (bulkSkipped > skippedBefore) {
@@ -1107,6 +1107,41 @@ public final class MainActivity extends Activity {
                 bulkProcessed() + 1, bulkTotal));
         startDownload(new DownloadQueue.Task(url, format, false, audioOnly,
                 accountTask != null && accountTask.httpsAssist));
+    }
+
+    private boolean isBulkMediaAlreadyDownloaded(String url, String format, boolean audioOnly) {
+        if (DownloadedMediaHistory.contains(this, url, format, audioOnly)) {
+            return true;
+        }
+        if (audioOnly) {
+            String existing = ExistingDownloadLookup.findExistingMediaForUrl(
+                    this, publicDownloadDirectory(), url, true, true);
+            if (existing != null) {
+                DownloadedMediaHistory.record(this, url, format, true);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private File publicDownloadDirectory() {
+        return new File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                "YTDown");
+    }
+
+    private String findAlreadyDownloadedReason(DownloadQueue.Task task) {
+        if (task == null || task.account) return null;
+        if (DownloadedMediaHistory.contains(this, task.url, task.format, task.audioOnly)) {
+            return "이미 다운로드한 링크라 중복 다운로드를 건너뛰었습니다.";
+        }
+        String existing = ExistingDownloadLookup.findExistingMediaForUrl(
+                this, publicDownloadDirectory(), task.url, task.audioOnly, false);
+        if (existing != null) {
+            DownloadedMediaHistory.record(this, task.url, task.format, task.audioOnly);
+            return "이미 저장된 파일 확인(" + existing + "): 중복 다운로드를 건너뛰었습니다.";
+        }
+        return null;
     }
 
     private int bulkProcessed() {
@@ -1165,19 +1200,31 @@ public final class MainActivity extends Activity {
 
     private void enqueueTask(DownloadQueue.Task task) {
         String url = task.url;
+        if (!task.account) {
+            String skipReason = findAlreadyDownloadedReason(task);
+            if (skipReason != null) {
+                DownloadLogStore.append(getApplicationContext(), task.url, skipReason);
+                if (!downloading && !bulkMode) {
+                    statusText.setText(R.string.already_downloaded_skipped);
+                }
+                toast(R.string.already_downloaded_skipped);
+                return;
+            }
+        }
         if (bulkMode || downloading || downloadQueue.size() > 0
                 || (wifiOnlySwitch.isChecked() && !isWifiConnected())) {
             // A running account scan only sees media found before it started, so one follow-up
             // scan of the same account may wait in the queue; already saved media are skipped
             // by the per-media download path. The pending check keeps it to a single rescan.
             boolean accountRescan = task.account && accountTask != null
-                    && url.equals(accountTask.url);
+                    && DownloadQueue.sameUrl(url, accountTask.url);
             if (downloadQueue.contains(url)) {
                 toast(task.account ? R.string.account_rescan_already_queued
                         : R.string.already_downloading);
                 return;
             }
-            if (url.equals(activeUrl) || (accountTask != null && url.equals(accountTask.url)
+            if (DownloadQueue.sameUrl(url, activeUrl)
+                    || (accountTask != null && DownloadQueue.sameUrl(url, accountTask.url)
                     && !accountRescan)) {
                 toast(R.string.already_downloading);
                 return;
@@ -1283,10 +1330,28 @@ public final class MainActivity extends Activity {
             clearDownloadNotifications();
             return;
         }
-        DownloadQueue.Task next = downloadQueue.poll();
+        boolean skippedAny = false;
+        DownloadQueue.Task next;
+        while ((next = downloadQueue.poll()) != null) {
+            if (!next.account) {
+                String skipReason = findAlreadyDownloadedReason(next);
+                if (skipReason != null) {
+                    DownloadLogStore.append(getApplicationContext(), next.url, skipReason);
+                    skippedAny = true;
+                    continue;
+                }
+            }
+            break;
+        }
         updateQueueUi();
         if (next != null) {
             startTask(next);
+        } else if (skippedAny) {
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            stopKeepAlive();
+            clearDownloadNotifications();
+            statusText.setText(R.string.already_downloaded_skipped);
+            toast(R.string.already_downloaded_skipped);
         }
     }
 
@@ -1354,7 +1419,7 @@ public final class MainActivity extends Activity {
         for (int index = 0; index < pending.size(); index++) {
             DownloadQueue.Task task = pending.get(index);
             boolean rescan = task.account && accountTask != null
-                    && task.url.equals(accountTask.url);
+                    && DownloadQueue.sameUrl(task.url, accountTask.url);
             items.add(new DownloadQueueDialog.Item(task, false, rescan,
                     getString(R.string.queue_state_waiting, index + 1)));
         }
@@ -1473,6 +1538,7 @@ public final class MainActivity extends Activity {
         int directVideoCount = 0;
         boolean structuredHasVideo = false;
         boolean structuredUnresolvedVideo = false;
+        boolean socialAllSkipped = false;
         Throwable photoError = null;
         if (socialUrl) {
             try {
@@ -1483,16 +1549,23 @@ public final class MainActivity extends Activity {
                 directVideoCount = result.videoCount;
                 structuredHasVideo = result.hasVideo;
                 structuredUnresolvedVideo = result.unresolvedVideo;
+                socialAllSkipped = result.allSkipped();
                 logDownload("구조화된 미디어 결과: 사진 " + imageCount
                         + "개, 직접 영상 " + directVideoCount
+                        + "개, 건너뜀 " + (result.skippedImageCount + result.skippedVideoCount)
                         + "개, 영상 표시=" + structuredHasVideo
                         + ", 미해결 영상=" + structuredUnresolvedVideo);
                 if (!structuredUnresolvedVideo
                         && (directVideoCount > 0 || (imageCount > 0 && !structuredHasVideo))) {
-                    MediaScannerConnection.scanFile(this,
-                            new String[]{outputDirectory.getAbsolutePath()}, null, null);
-                    logDownload("구조화된 전체 미디어 다운로드 완료");
-                    runOnUiThread(() -> finishDownload(generation, true, null));
+                    if (!socialAllSkipped) {
+                        MediaScannerConnection.scanFile(this,
+                                new String[]{outputDirectory.getAbsolutePath()}, null, null);
+                    }
+                    logDownload(socialAllSkipped
+                            ? "구조화된 전체 미디어가 이미 저장되어 건너뜀"
+                            : "구조화된 전체 미디어 다운로드 완료");
+                    final boolean skippedOnly = socialAllSkipped;
+                    runOnUiThread(() -> finishDownload(generation, true, null, skippedOnly));
                     return;
                 }
             } catch (InterruptedException cancelled) {
@@ -1508,6 +1581,16 @@ public final class MainActivity extends Activity {
             } catch (Throwable error) {
                 photoError = error;
                 logDownload("구조화된 미디어 검사 실패: " + safeMessage(error));
+            }
+        }
+
+        if (imageCount == 0 && directVideoCount == 0) {
+            String existingMedia = ExistingDownloadLookup.findExistingMediaForUrl(
+                    this, publicDownloadDirectory(), url, audioOnly, true);
+            if (existingMedia != null) {
+                logDownload("이미 저장된 파일 확인(" + existingMedia + "): yt-dlp 다운로드 건너뜀");
+                runOnUiThread(() -> finishDownload(generation, true, null, true));
+                return;
             }
         }
 
@@ -1588,6 +1671,12 @@ public final class MainActivity extends Activity {
         }
         request.addOption("--yes-playlist");
         request.addOption("--no-mtime");
+        request.addOption("--no-overwrites");
+        if (!singlePass) {
+            File archiveFile = new File(getNoBackupFilesDir(),
+                    audioOnly ? "download-archive-audio.txt" : "download-archive-video.txt");
+            request.addOption("--download-archive", archiveFile.getAbsolutePath());
+        }
         if (audioOnly) {
             request.addOption("--extract-audio");
             request.addOption("--audio-format", "m4a");
@@ -1639,8 +1728,7 @@ public final class MainActivity extends Activity {
                 showProgressNotification(currentProgress, false);
                 return Unit.INSTANCE;
             }
-            if (!TextUtils.isEmpty(line)
-                    && line.toLowerCase(Locale.US).contains("already been downloaded")) {
+            if (ExistingDownloadLookup.isAlreadyDownloadedOutput(line)) {
                 alreadyDownloaded.set(true);
             }
             if (singlePass && !audioOnly) {
@@ -1658,6 +1746,7 @@ public final class MainActivity extends Activity {
         };
 
         boolean videoDownloaded = false;
+        boolean ytDlpSkippedOnly = false;
         int ytDlpVideoCount = 0;
         Throwable videoError = null;
         try {
@@ -1673,6 +1762,11 @@ public final class MainActivity extends Activity {
                 List<File> audioFiles = DownloadArtifactTracker.completedAudioFiles(
                         outputDirectory, response.getOut());
                 if (audioFiles.isEmpty()) {
+                    if (alreadyDownloaded.get()) {
+                        logDownload("이미 추출된 음원이라 중복 다운로드를 건너뛰었습니다.");
+                        runOnUiThread(() -> finishDownload(generation, true, null, true));
+                        return;
+                    }
                     throw new IllegalStateException("실제 M4A 음원 파일이 없습니다. 사진 전용 게시물이나 음원 없는 영상은 추출할 수 없습니다.");
                 }
                 String[] paths = new String[audioFiles.size()];
@@ -1715,9 +1809,11 @@ public final class MainActivity extends Activity {
                         + " (" + videoFile.length() + " bytes)");
             }
             videoDownloaded = true;
+            ytDlpSkippedOnly = videoFiles.isEmpty() && alreadyDownloaded.get();
             ytDlpVideoCount = Math.max(videoFiles.size(), alreadyDownloaded.get() ? 1 : 0);
-            logDownload("yt-dlp 전체 동영상 항목 다운로드 완료: "
-                    + ytDlpVideoCount + "개");
+            logDownload(ytDlpSkippedOnly
+                    ? "이미 저장된 동영상이라 중복 다운로드를 건너뛰었습니다."
+                    : "yt-dlp 전체 동영상 항목 다운로드 완료: " + ytDlpVideoCount + "개");
         } catch (Throwable error) {
             if (!isDownloadActive(generation)) {
                 return;
@@ -1751,8 +1847,10 @@ public final class MainActivity extends Activity {
                 directVideoCount = result.videoCount;
                 structuredHasVideo = result.hasVideo;
                 structuredUnresolvedVideo = result.unresolvedVideo;
+                socialAllSkipped = result.allSkipped();
                 logDownload("소셜 미디어 처리 결과: 사진 " + result.imageCount
                         + "개, 직접 영상 " + result.videoCount
+                        + "개, 건너뜀 " + (result.skippedImageCount + result.skippedVideoCount)
                         + "개, 영상 표시=" + result.hasVideo);
             } catch (InterruptedException cancelled) {
                 return;
@@ -1768,6 +1866,9 @@ public final class MainActivity extends Activity {
         boolean unresolvedVideo = structuredUnresolvedVideo && !videoDownloaded;
         boolean success = !unresolvedVideo
                 && (videoDownloaded || directVideoCount > 0 || imageCount > 0);
+        boolean skippedDuplicate = success
+                && ((ytDlpSkippedOnly && directVideoCount == 0 && imageCount == 0)
+                || (!videoDownloaded && socialAllSkipped));
         String failureDetail = photoError instanceof SocialImageDownloader.LoginRequiredException
                 ? safeMessage(photoError)
                 : videoError != null ? safeMessage(videoError)
@@ -1783,16 +1884,18 @@ public final class MainActivity extends Activity {
             }
         }
         if (success) {
-            if (!singlePass || Build.VERSION.SDK_INT < 29) {
+            if (!skippedDuplicate && (!singlePass || Build.VERSION.SDK_INT < 29)) {
                 MediaScannerConnection.scanFile(this,
                         new String[]{outputDirectory.getAbsolutePath()}, null, null);
             }
-            logDownload("전체 미디어 완료: 영상="
-                    + (ytDlpVideoCount + directVideoCount) + "개, 사진=" + imageCount + "개");
+            logDownload(skippedDuplicate
+                    ? "이미 저장된 미디어라 중복 다운로드를 건너뛰었습니다."
+                    : "전체 미디어 완료: 영상="
+                            + (ytDlpVideoCount + directVideoCount) + "개, 사진=" + imageCount + "개");
         }
         final String finalFailureDetail = failureDetail;
         runOnUiThread(() -> finishDownload(
-                generation, success, success ? null : finalFailureDetail));
+                generation, success, success ? null : finalFailureDetail, skippedDuplicate));
     }
 
     private SocialImageDownloader.Result downloadSocialMedia(
@@ -1961,10 +2064,16 @@ public final class MainActivity extends Activity {
     }
 
     private void finishDownload(long generation, boolean success, String detail) {
+        finishDownload(generation, success, detail, false);
+    }
+
+    private void finishDownload(long generation, boolean success, String detail,
+                                boolean skippedDuplicate) {
         if (!isDownloadActive(generation)) {
             return;
         }
-        logDownload(success ? "작업 성공" : "작업 실패: " + detail);
+        logDownload(skippedDuplicate ? "중복 파일 건너뜀"
+                : (success ? "작업 성공" : "작업 실패: " + detail));
         DownloadQueue.Task finished = activeTask;
         // Success here means the worker verified the saved output for the whole link; failed,
         // partial and cancelled links (stale generation) are not recorded and stay retryable.
@@ -1984,11 +2093,13 @@ public final class MainActivity extends Activity {
             progressBar.setIndeterminate(false);
             progressBar.setProgress(100);
             percentText.setText(getString(R.string.percent_format, 100));
-            statusText.setText(R.string.status_complete);
+            int statusMessage = skippedDuplicate
+                    ? R.string.already_downloaded_skipped : R.string.status_complete;
+            statusText.setText(statusMessage);
             if (!sessionContinues) {
                 stopKeepAlive();
                 clearDownloadNotifications();
-                toast(R.string.status_complete);
+                toast(statusMessage);
             }
         } else {
             statusText.setText(getString(R.string.status_with_detail,
@@ -2000,11 +2111,15 @@ public final class MainActivity extends Activity {
             }
         }
         if (bulkMode) {
-            bulkAttempted++;
-            if (success) {
-                bulkSucceeded++;
+            if (skippedDuplicate) {
+                bulkSkipped++;
             } else {
-                bulkFailed++;
+                bulkAttempted++;
+                if (success) {
+                    bulkSucceeded++;
+                } else {
+                    bulkFailed++;
+                }
             }
             updateQueueUi();
             if (bulkMediaUrls.isEmpty()) {

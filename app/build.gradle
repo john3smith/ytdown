@@ -66,8 +66,8 @@ android {
         applicationId "com.local.ytdown"
         minSdk 24
         targetSdk 36
-        versionCode 84
-        versionName "1.9.45"
+        versionCode 85
+        versionName "1.9.46"
         testInstrumentationRunner "com.local.ytdown.StreamProgressInstrumentation"
 
         ndk {

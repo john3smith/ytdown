@@ -90,4 +90,25 @@ public class DownloadQueueTest {
         assertEquals("https://example.com/2", queue.poll().url);
         assertEquals(0, queue.size());
     }
+
+    @Test
+    public void rejectsEquivalentNormalizedUrlsInQueueAndActiveDownload() {
+        DownloadQueue queue = new DownloadQueue();
+        assertFalse(queue.offer(
+                new DownloadQueue.Task("https://www.youtube.com/watch?v=dQw4w9WgXcQ&feature=shared", "best"),
+                "https://youtu.be/dQw4w9WgXcQ?si=abc"));
+        assertTrue(queue.offer(
+                new DownloadQueue.Task("https://twitter.com/Alice/status/12345/photo/1", "best"),
+                null));
+        assertTrue(queue.contains("https://x.com/i/status/12345"));
+        assertFalse(queue.offer(
+                new DownloadQueue.Task("https://x.com/alice/status/12345?s=20", "best"),
+                null));
+        assertTrue(queue.offer(
+                new DownloadQueue.Task("https://www.instagram.com/reel/AbCd123/", "best"),
+                null));
+        assertFalse(queue.offer(
+                new DownloadQueue.Task("https://instagram.com/p/AbCd123/", "best"),
+                null));
+    }
 }

@@ -39,7 +39,7 @@ final class DownloadQueue {
     private final Deque<Task> pending = new ArrayDeque<>();
 
     boolean offer(Task task, String activeUrl) {
-        if (task.url.equals(activeUrl) || contains(task.url) || pending.size() >= MAX_PENDING) {
+        if (sameUrl(task.url, activeUrl) || contains(task.url) || pending.size() >= MAX_PENDING) {
             return false;
         }
         pending.addLast(task);
@@ -55,7 +55,7 @@ final class DownloadQueue {
     }
 
     boolean remove(String url) {
-        return pending.removeIf(task -> task.url.equals(url));
+        return pending.removeIf(task -> task.url.equals(url) || sameUrl(task.url, url));
     }
 
     int size() {
@@ -68,7 +68,7 @@ final class DownloadQueue {
 
     boolean contains(String url) {
         for (Task task : pending) {
-            if (task.url.equals(url)) {
+            if (sameUrl(task.url, url)) {
                 return true;
             }
         }
@@ -77,5 +77,12 @@ final class DownloadQueue {
 
     void clear() {
         pending.clear();
+    }
+
+    static boolean sameUrl(String left, String right) {
+        if (left == null || right == null) return false;
+        if (left.equals(right)) return true;
+        return DownloadedMediaHistory.normalizeUrl(left)
+                .equals(DownloadedMediaHistory.normalizeUrl(right));
     }
 }
